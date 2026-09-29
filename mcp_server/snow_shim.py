@@ -23,11 +23,33 @@ app = Flask(__name__)
 DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "incidents.csv")
 
 def load_incidents():
+    """Load incidents from CSV.
+
+    Guards against rows where an unquoted comma in the free-text
+    'description' column splits it into extra columns. csv.DictReader
+    stores those overflow values under the key None, which later crashes
+    jsonify (it sorts keys, and None cannot be compared with str).
+    """
     incidents = {}
     try:
-        with open(DATA_FILE, newline="") as f:
-            for row in csv.DictReader(f):
-                incidents[row["number"]] = dict(row)
+        with open(DATA_FILE, newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            header = [h.strip() for h in next(reader)]
+            desc_idx = header.index("description")
+            for line_no, values in enumerate(reader, start=2):
+                if not values or not any(v.strip() for v in values):
+                    continue  # skip blank lines
+                extra = len(values) - len(header)
+                if extra > 0:
+                    # Re-join the pieces of the description that were split on commas
+                    merged = ",".join(values[desc_idx:desc_idx + extra + 1])
+                    values = values[:desc_idx] + [merged] + values[desc_idx + extra + 1:]
+                    print(f"[ServiceNow Mock] Warning: line {line_no} had {extra} unquoted "
+                          f"comma(s) in 'description' - merged back together.")
+                elif extra < 0:
+                    values = values + [""] * (-extra)  # pad missing trailing fields
+                row = {k: v.strip().strip('"') for k, v in zip(header, values)}
+                incidents[row["number"]] = row
     except FileNotFoundError:
         print(f"Warning: {DATA_FILE} not found. Starting with empty dataset.")
     return incidents
