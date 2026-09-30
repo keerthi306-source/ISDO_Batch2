@@ -1,362 +1,324 @@
 """
-ISDO Lab C6 — LangGraph Orchestrator: Wire All Agents
-A LangGraph StateGraph that routes a ticket through the ISDO agents:
+ISDO Capstone - Lab C7
+orchestrator/supervisor.py
 
-    P2 / P3 / P4 :  Triage → Resolution → SLA → Communication
-    P1 at risk   :  Triage → Resolution → SLA → HITL → Communication
+LangGraph StateGraph supervisor with an extended HITL (Human-in-the-Loop) gate.
 
-Reuses the building blocks from earlier labs (single source of truth):
-    agents/resolution_agent.py  (C4) → ChromaDB search_kb + code guardrail
-    agents/sla_agent.py         (C5) → get_sla_status, HITL approval prompt, escalation teams
+Flow:
+    triage -> resolution -> sla -> (hitl?) -> communication -> END
 
-Run from the project root (or from inside orchestrator/ — both work):
-    python orchestrator/supervisor.py
-    python orchestrator/supervisor.py --show-graph     (also prints a Mermaid diagram)
+The HITL gate fires for ANY of these conditions (Lab C7):
+    1. P1 ticket where SLA status is CRITICAL or BREACHED        (from C5/C6)
+    2. Resolution Agent KB confidence is LOW (any priority)       (new in C7)
+    3. Access Grant request: category == 'Access' and
+       request_type == 'Access Grant' (REQ- tickets)              (new in C7)
 
-Optional (scripted / non-interactive runs), pre-answer the HITL prompt:
-    $env:HITL_ANSWERS="y"       (PowerShell)
+If the HITL decision is REJECTED, the graph still continues to the
+Communication node, but sends a 'pending approval' message instead of a
+resolution.
+
+NOTE: If your C1-C5 agents live in separate modules, point the four
+`run_*` helper functions below at them. The node functions, state, routing
+and HITL logic do not need to change.
 """
 
-import json
-import operator
-import os
+from __future__ import annotations
+
 import re
-import sys
 from datetime import datetime
-from pathlib import Path
-from typing import Annotated, TypedDict
+from typing import List, Optional, TypedDict
 
-# Windows consoles can choke on arrows/emoji — force UTF-8 output.
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+from langgraph.graph import END, StateGraph
 
-# Project root resolved from this file (falls back to cwd in Interactive Window / Jupyter).
-try:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
-except NameError:
-    PROJECT_ROOT = Path.cwd().parent if Path.cwd().name == "orchestrator" else Path.cwd()
-sys.path.insert(0, str(PROJECT_ROOT / "agents"))
 
-import anthropic
-from dotenv import load_dotenv
-from langgraph.graph import StateGraph, START, END
-
-# Reuse the C4 and C5 agents' tools (importing them does not run their demos).
-from resolution_agent import get_kb, search_kb, apply_guardrail, score_to_confidence
-from sla_agent import get_sla_status, hitl_approve, team_for
-
-load_dotenv(PROJECT_ROOT / ".env")
-load_dotenv()
-
-API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-if not API_KEY:
-    sys.exit("ERROR: ANTHROPIC_API_KEY not set. Add it to your .env file (same one used in C2-C5).")
-
-client = anthropic.Anthropic(api_key=API_KEY)
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
-TEMPERATURE = 0.0
-
-CATEGORIES = ["Network", "Application", "Hardware", "Access", "Email", "Server", "Software"]
-PRIORITIES = ["P1", "P2", "P3", "P4"]
-ASSIGNMENT_GROUPS = ["Network-Ops", "App-Support", "Desktop-Support", "Service-Desk",
-                     "Security-Ops", "Server-Ops", "Email-Support", "DBA-Team"]
-
-# ── SHARED STATE (Step 2) ─────────────────────────────────────────────────────
-
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 class TicketState(TypedDict, total=False):
-    """Single shared memory for the graph. Every field is optional at start;
-    each node writes only the fields it owns."""
-    # Input ticket
+    # Ticket input
     ticket_number: str
     short_description: str
     description: str
     category: str
     priority: str
     sla_due: str
-    # Triage agent
-    triage_category: str
-    triage_priority: str
-    triage_assignment_group: str
-    pii_detected: bool
-    # Resolution agent
-    kb_article: str
-    resolution_text: str
-    auto_resolve: bool
-    confidence: str
-    confidence_score: float
-    # SLA agent
-    sla_breach_risk: str
-    sla_minutes_remaining: int
-    escalation_required: bool
-    escalation_team: str
+    request_type: str          # e.g. 'Access Grant' for REQ- tickets
+
+    # Agent outputs
+    triage_summary: str
+    assignment_group: str
+    resolution_steps: List[str]
+    kb_article: Optional[str]
+    confidence: str            # HIGH / MEDIUM / LOW
+    sla_status: str            # OK / AT_RISK / CRITICAL / BREACHED
+    minutes_remaining: int
+
+    # HITL
     hitl_required: bool
-    # HITL node
-    hitl_approved: bool
-    # Communication agent
+    hitl_reason: str           # NEW in C7 - why the gate fired
+    hitl_decision: str         # APPROVED / REJECTED / NOT_REQUIRED
+
+    # Output
     user_message: str
-    final_status: str
-    # Every node APPENDS here — operator.add merges lists instead of overwriting.
-    audit_log: Annotated[list, operator.add]
-
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-
-def audit(agent: str, action: str, detail: str) -> list:
-    """Build one audit entry (returned as a 1-item list so LangGraph appends it)."""
-    print(f"  [AUDIT] {agent}: {action}")
-    return [{"timestamp": datetime.now().isoformat(timespec="seconds"),
-             "agent": agent, "action": action, "detail": detail}]
+    audit_log: List[dict]
 
 
-def header(title: str):
-    print(f"\n▶ {title}")
-
-
-def most_severe(*priorities) -> str:
-    """P1 beats P2 beats P3 ... — used so a triage downgrade can never skip a P1 safeguard."""
-    valid = [p for p in priorities if p in PRIORITIES]
-    return min(valid) if valid else "P3"
-
-
-_temperature_mode = "extra_body"
-
-
-def ask_claude(system: str, user: str, max_tokens: int = 800) -> str:
-    """One plain-text model call (same temperature fallback as C3–C5)."""
-    global _temperature_mode
-    params = dict(model=MODEL, max_tokens=max_tokens, system=system,
-                  messages=[{"role": "user", "content": user}])
-    response = None
-    if _temperature_mode == "extra_body":
-        try:
-            response = client.messages.create(**params, extra_body={"temperature": TEMPERATURE})
-        except anthropic.BadRequestError as e:
-            if "temperature" not in str(e).lower():
-                raise
-            print("  (note: this model doesn't accept a custom temperature — using its default)")
-            _temperature_mode = "off"
-    if response is None:
-        response = client.messages.create(**params)
-    return "".join(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
-
-
-def parse_json(text: str) -> dict:
-    """Pull the first {...} object out of a model reply (tolerates ```json fences)."""
-    match = re.search(r"\{.*\}", text, re.S)
-    if not match:
-        raise ValueError(f"no JSON object in reply: {text[:120]!r}")
-    return json.loads(match.group(0))
-
-
-# Simple backstop for PII the model might miss (emails, employee IDs, IPv4 addresses).
-PII_PATTERNS = [r"[\w.+-]+@[\w-]+\.[\w.]+", r"\b(?:emp[-_ ]?id|ZEN-\d{3,})", r"\b\d{1,3}(?:\.\d{1,3}){3}\b"]
-
-
-def regex_pii(text: str) -> bool:
-    return any(re.search(p, text, re.I) for p in PII_PATTERNS)
-
-# ── NODE 1: TRIAGE ────────────────────────────────────────────────────────────
-
-TRIAGE_SYSTEM = f"""You are the ISDO Triage Agent for Zensar's IT Service Desk.
-Classify the ticket and reply with ONLY a JSON object, no other text:
-{{"category": one of {CATEGORIES},
-  "priority": one of {PRIORITIES},
-  "assignment_group": one of {ASSIGNMENT_GROUPS},
-  "pii_detected": true/false (names, emails, employee IDs, IP addresses; "[REDACTED]" is not PII),
-  "reasoning": "one sentence"}}
-
-Priority rules:
-- P1: Service down, many users affected, or security breach
-- P2: Significant impact, single department or function affected
-- P3: Single user impacted, workaround exists
-- P4: Request (new software, access, equipment)"""
-
-
-def triage_node(state: TicketState) -> dict:
-    header(f"TRIAGE AGENT — {state['ticket_number']}")
-    text = f"{state.get('short_description', '')}\n{state.get('description', '')}"
-    try:
-        result = parse_json(ask_claude(
-            TRIAGE_SYSTEM,
-            f"Ticket: {state['ticket_number']}\nSummary: {state.get('short_description')}\n"
-            f"Details: {state.get('description')}"))
-        note = result.get("reasoning", "")
-    except (ValueError, json.JSONDecodeError) as e:
-        print(f"  (triage JSON could not be parsed — keeping the ticket's own values: {e})")
-        result, note = {}, "fallback to ticket values (unparseable model output)"
-
-    # Validate every field against the allowed values; fall back to the ticket record.
-    category = result.get("category") if result.get("category") in CATEGORIES else state.get("category", "Software")
-    priority = result.get("priority") if result.get("priority") in PRIORITIES else state.get("priority", "P3")
-    group = result.get("assignment_group") if result.get("assignment_group") in ASSIGNMENT_GROUPS else "Service-Desk"
-    pii = bool(result.get("pii_detected")) or regex_pii(text)
-
-    print(f"  Category: {category}")
-    print(f"  Priority: {priority}")
-    print(f"  Assign To: {group}")
-    print(f"  PII: {pii}")
-    return {
-        "triage_category": category,
-        "triage_priority": priority,
-        "triage_assignment_group": group,
-        "pii_detected": pii,
-        "audit_log": audit("TriageAgent", "classify_ticket",
-                           f"{category}/{priority} → {group}; PII={pii}. {note}"),
+# ---------------------------------------------------------------------------
+# Audit helper
+# ---------------------------------------------------------------------------
+def audit(state: TicketState, agent: str, action: str, detail: str) -> List[dict]:
+    """Append an audit entry and print it. Returns the updated log."""
+    entry = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "ticket": state.get("ticket_number", "?"),
+        "agent": agent,
+        "action": action,
+        "detail": detail,
     }
+    print(f"  [AUDIT] {agent}: {action} -- {detail}")
+    return list(state.get("audit_log", [])) + [entry]
 
-# ── NODE 2: RESOLUTION ────────────────────────────────────────────────────────
 
-RESOLUTION_SYSTEM = """You are the ISDO Resolution Agent for Zensar's IT Service Desk.
-You are given a ticket and the best-matching KB article. Reply with ONLY a JSON object:
-{"resolution_text": "3-4 numbered, plain-English steps copied from the article's Resolution Steps",
- "auto_resolve": true/false}
+# ---------------------------------------------------------------------------
+# Agent logic (swap these for your C1-C5 agent calls if needed)
+# ---------------------------------------------------------------------------
+ASSIGNMENT_GROUPS = {
+    "Network": "Network Operations",
+    "Application": "Application Support",
+    "Access": "Identity & Access Management",
+    "Hardware": "End User Computing",
+    "Software": "End User Computing",
+}
 
-auto_resolve = true ONLY when ALL are true:
-- confidence is HIGH
-- priority is P2, P3 or P4 (never P1)
-- the article's "Auto-Resolve Eligibility" section says this case is L1 auto-resolvable
-If confidence is LOW, write a short L2 escalation note instead and set auto_resolve false."""
+# Tiny local KB used by the Resolution Agent to score confidence.
+KNOWLEDGE_BASE = [
+    {
+        "id": "KB0010001",
+        "title": "VPN connection drops / cannot connect to GlobalProtect VPN",
+        "keywords": {"vpn", "globalprotect", "connect", "connection", "tunnel", "drops", "remote"},
+        "steps": [
+            "Confirm internet connectivity without VPN.",
+            "Restart the GlobalProtect client and re-authenticate with MFA.",
+            "Clear cached VPN credentials and reconnect to the nearest gateway.",
+            "If still failing, collect client logs and escalate to Network Operations.",
+        ],
+    },
+    {
+        "id": "KB0020045",
+        "title": "SAP production system down / SAP login failures",
+        "keywords": {"sap", "production", "down", "outage", "erp", "login", "users"},
+        "steps": [
+            "Check SAP application server status in SM51.",
+            "Verify database connectivity and HANA service health.",
+            "Restart the affected dialog instance if hung.",
+            "Engage SAP Basis on-call for P1 bridge.",
+        ],
+    },
+    {
+        "id": "KB0030012",
+        "title": "Provisioning VPN access for new users and contractors",
+        "keywords": {"vpn", "access", "contractor", "new", "user", "provision", "grant"},
+        "steps": [
+            "Verify the requester's manager approval and contract end date.",
+            "Add the user to the VPN-Contractors AD group.",
+            "Send VPN onboarding instructions to the user's email.",
+        ],
+    },
+]
+
+
+def _tokens(text: str) -> set:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def run_triage(state: TicketState) -> dict:
+    category = state.get("category", "General")
+    group = ASSIGNMENT_GROUPS.get(category, "Service Desk")
+    summary = f"{state['priority']} {category} ticket: {state['short_description']}"
+    return {"triage_summary": summary, "assignment_group": group}
+
+
+def run_resolution(state: TicketState) -> dict:
+    """Score the ticket against the KB. Confidence = keyword overlap."""
+    words = _tokens(state["short_description"] + " " + state.get("description", ""))
+    best, best_score = None, 0
+    for article in KNOWLEDGE_BASE:
+        score = len(words & article["keywords"])
+        if score > best_score:
+            best, best_score = article, score
+
+    if best_score >= 3:
+        confidence = "HIGH"
+    elif best_score == 2:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+
+    if best is None or confidence == "LOW":
+        return {
+            "kb_article": None,
+            "resolution_steps": ["No clear KB match -- manual investigation required."],
+            "confidence": "LOW",
+        }
+    return {"kb_article": best["id"], "resolution_steps": best["steps"], "confidence": confidence}
+
+
+def run_sla(state: TicketState, now: Optional[datetime] = None) -> dict:
+    now = now or datetime.now()
+    due = datetime.strptime(state["sla_due"], "%Y-%m-%d %H:%M:%S")
+    minutes = int((due - now).total_seconds() // 60)
+    if minutes < 0:
+        status = "BREACHED"
+    elif minutes <= 30:
+        status = "CRITICAL"
+    elif minutes <= 120:
+        status = "AT_RISK"
+    else:
+        status = "OK"
+    return {"sla_status": status, "minutes_remaining": minutes}
+
+
+def run_communication(state: TicketState) -> str:
+    tn = state["ticket_number"]
+    decision = state.get("hitl_decision", "NOT_REQUIRED")
+    is_access = _is_access_grant(state)
+
+    if decision == "REJECTED":
+        return (
+            f"Dear User, your ticket {tn} has been received and is pending approval. "
+            f"A support engineer will review it and update you shortly. "
+            f"No changes have been made yet."
+        )
+
+    if is_access:
+        return (
+            f"Dear Requester, your access grant request {tn} has been approved. "
+            f"The {state.get('assignment_group')} team will provision access and "
+            f"send onboarding instructions to the email on the request."
+        )
+
+    steps = "\n    ".join(f"{i}. {s}" for i, s in enumerate(state.get("resolution_steps", []), 1))
+    if state.get("confidence") == "LOW":
+        return (
+            f"Dear User, your ticket {tn} has been reviewed by an engineer. "
+            f"We could not find a known fix, so it has been assigned to "
+            f"{state.get('assignment_group')} for investigation. We will update you shortly."
+        )
+
+    prefix = "Approved by on-call engineer. " if decision == "APPROVED" else ""
+    return (
+        f"Dear User. {prefix}Here is the resolution for ticket {tn} "
+        f"(KB {state.get('kb_article')}):\n    {steps}"
+    )
+
+
+def _is_access_grant(state: TicketState) -> bool:
+    return (
+        state.get("category") == "Access"
+        and state.get("request_type") == "Access Grant"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Graph nodes
+# ---------------------------------------------------------------------------
+def triage_node(state: TicketState) -> dict:
+    print("\n> TRIAGE AGENT")
+    out = run_triage(state)
+    print(f"  {out['triage_summary']} -> {out['assignment_group']}")
+    return {**out, "audit_log": audit(state, "TriageAgent", "classified", out["assignment_group"])}
 
 
 def resolution_node(state: TicketState) -> dict:
-    header("RESOLUTION AGENT — searching KB")
-    priority = most_severe(state.get("priority"), state.get("triage_priority"))
-    query = f"{state.get('short_description', '')}. {state.get('description', '')}"
-    hits = search_kb(query)["articles"]           # ChromaDB query (from Lab C4)
-
-    top = hits[0] if hits else None
-    score = top["confidence_score"] if top else None
-    confidence = score_to_confidence(score) if top else "LOW"
-    article = top["article"] if top and confidence != "LOW" else "none"
-
-    try:
-        draft = parse_json(ask_claude(
-            RESOLUTION_SYSTEM,
-            f"Ticket: {state['ticket_number']}\nCategory: {state.get('triage_category')}\n"
-            f"Priority: {priority}\nSummary: {state.get('short_description')}\n"
-            f"Details: {state.get('description')}\n\n"
-            f"KB confidence: {confidence} (score {score})\n"
-            f"KB article: {article}\n---\n{top['content'] if top else '(no article)'}"))
-    except (ValueError, json.JSONDecodeError) as e:
-        print(f"  (resolution JSON could not be parsed: {e})")
-        draft = {"resolution_text": "Resolution could not be drafted — route to L2 for review.",
-                 "auto_resolve": False}
-
-    draft.update(confidence=confidence, kb_article_used=article,
-                 ticket_number=state["ticket_number"])
-    final = apply_guardrail(draft, score, priority)   # code decides, not the model (C4)
-
-    pct = f" ({score:.0%})" if score is not None else ""
-    print(f"  KB Article: {article}")
-    print(f"  Confidence: {final['confidence']}{pct}  |  Auto-resolve: {final['auto_resolve']}")
-    for note in final.get("guardrail_notes", []):
-        print(f"  Guardrail: {note}")
+    print("\n> RESOLUTION AGENT")
+    out = run_resolution(state)
+    print(f"  KB: {out['kb_article'] or 'none'} | Confidence: {out['confidence']}")
     return {
-        "kb_article": article,
-        "resolution_text": str(final.get("resolution_text", "")),
-        "auto_resolve": bool(final["auto_resolve"]),
-        "confidence": final["confidence"],
-        "confidence_score": score if score is not None else 0.0,
-        "audit_log": audit("ResolutionAgent", "search_kb",
-                           f"{article} | {final['confidence']}{pct} | auto_resolve={final['auto_resolve']}"),
+        **out,
+        "audit_log": audit(
+            state, "ResolutionAgent", "kb_match", f"{out['kb_article'] or 'none'} ({out['confidence']})"
+        ),
     }
 
-# ── NODE 3: SLA ───────────────────────────────────────────────────────────────
 
 def sla_node(state: TicketState) -> dict:
-    header("SLA AGENT — checking deadline")
-    # The SLA clock belongs to the priority recorded on the ticket (sla_due was set from it).
-    sla = get_sla_status(state["ticket_number"], state["sla_due"], state.get("priority", "P3"))
-    if "error" in sla:
-        print(f"  SLA error: {sla['error']}")
-        return {"sla_breach_risk": "UNKNOWN", "escalation_required": False, "hitl_required": False,
-                "audit_log": audit("SLAAgent", "get_sla_status", sla["error"])}
+    """Compute SLA status and decide whether the HITL gate is required."""
+    print("\n> SLA AGENT")
+    out = run_sla(state)
+    print(f"  SLA status: {out['sla_status']} ({out['minutes_remaining']} min remaining)")
 
-    risk, minutes = sla["breach_risk"], sla["minutes_remaining"]
-    is_p1 = most_severe(state.get("priority"), state.get("triage_priority")) == "P1"
-    hitl_required = is_p1 and risk in ("CRITICAL", "BREACHED")
-    escalation_required = bool(sla["requires_escalation"]) or hitl_required
-    team = team_for(state.get("triage_category") or state.get("category", ""))
+    merged = {**state, **out}
+    reasons = []
 
-    print(f"  SLA Risk: {risk}  |  Minutes remaining: {minutes}")
-    print(f"  Escalation required: {escalation_required}  |  HITL required: {hitl_required}")
-    return {
-        "sla_breach_risk": risk,
-        "sla_minutes_remaining": minutes,
-        "escalation_required": escalation_required,
-        "escalation_team": team,
-        "hitl_required": hitl_required,
-        "audit_log": audit("SLAAgent", "get_sla_status",
-                           f"{risk}, {minutes} min remaining; escalation={escalation_required}, "
-                           f"hitl={hitl_required}"),
-    }
+    # Trigger 1: P1 + SLA CRITICAL/BREACHED (existing C6 behaviour)
+    if merged["priority"] == "P1" and merged["sla_status"] in ("CRITICAL", "BREACHED"):
+        reasons.append(f"P1 SLA {merged['sla_status']} -- escalation requires on-call approval")
 
-# ── NODE 4: HITL ──────────────────────────────────────────────────────────────
+    # Trigger 2: LOW KB confidence, regardless of priority
+    if merged.get("confidence") == "LOW":
+        reasons.append("LOW KB CONFIDENCE -- Resolution Agent could not find a clear fix")
+
+    # Trigger 3: Access Grant request, regardless of priority
+    if _is_access_grant(merged):
+        reasons.append(
+            f"ACCESS GRANT -- {merged['short_description'].lower()} requires security approval"
+        )
+
+    hitl_required = bool(reasons)
+    hitl_reason = "; ".join(reasons) if reasons else ""
+
+    log = audit(state, "SLAAgent", "sla_check", out["sla_status"])
+    if hitl_required:
+        log = audit({**state, "audit_log": log}, "SLAAgent", "hitl_triggered", hitl_reason)
+
+    return {**out, "hitl_required": hitl_required, "hitl_reason": hitl_reason, "audit_log": log}
+
 
 def hitl_node(state: TicketState) -> dict:
-    header("HITL GATE — human approval required")
-    approved = hitl_approve(          # prompts "Approve escalation? [y/n]" (from Lab C5)
-        state["ticket_number"],
-        "Escalate P1 ticket",
-        f"Escalate to {state.get('escalation_team')} — SLA {state.get('sla_breach_risk')}, "
-        f"{state.get('sla_minutes_remaining')} min remaining")
-    return {
-        "hitl_approved": approved,
-        "audit_log": audit("HITLGate", "human_approval",
-                           f"{'APPROVED' if approved else 'REJECTED'} escalation to {state.get('escalation_team')}"),
-    }
+    print("\n> HITL GATE -- human approval required")
+    print("  " + "WARNING " * 8)
+    print(f"  Ticket: {state['ticket_number']} | Priority: {state['priority']}")
+    print(f"  Reason: {state.get('hitl_reason', 'unspecified')}")
+    print("  " + "WARNING " * 8)
 
-# ── NODE 5: COMMUNICATION ─────────────────────────────────────────────────────
+    answer = ""
+    while answer not in ("y", "n"):
+        answer = input("  Approve action? [y/n]: ").strip().lower()
 
-COMMS_SYSTEM = """You are the ISDO Communication Agent for Zensar's IT Service Desk.
-Write a short, friendly, professional message to the end user (max 120 words).
-Start with "Dear User, regarding <ticket number>". Plain text only, no markdown.
-Never include personal data (names, emails, employee IDs, IP addresses).
-Do not promise anything beyond the facts you are given."""
+    decision = "APPROVED" if answer == "y" else "REJECTED"
+    log = audit(
+        state,
+        "HITLGate",
+        "approval_decision",
+        f"{decision} (reason: {state.get('hitl_reason', '')})",
+    )
+    print(f"  Decision: {decision}")
+    return {"hitl_decision": decision, "audit_log": log}
 
 
 def communication_node(state: TicketState) -> dict:
-    header("COMMUNICATION AGENT")
-    num = state["ticket_number"]
-    group = state.get("triage_assignment_group", "the service desk")
-
-    if state.get("auto_resolve"):
-        case, status = "self_service_resolution", "RESOLVED"
-        brief = (f"The issue can be fixed by the user. Include these steps:\n{state.get('resolution_text')}\n"
-                 "Ask them to reply if the steps do not work, and the ticket will be reopened.")
-    elif state.get("hitl_approved"):
-        case, status = "escalation_confirmation", "ESCALATED"
-        brief = (f"This is a critical incident. It has been escalated to {state.get('escalation_team')} "
-                 "with priority handling. Reassure the user that the team is actively working on it.")
-    else:
-        case, status = "assignment_notification", "ASSIGNED"
-        brief = f"The ticket has been assigned to the {group} team, who will contact the user."
-
-    facts = f"Ticket: {num}\nIssue: {state.get('short_description')}\nSituation: {brief}"
-    try:
-        message = ask_claude(COMMS_SYSTEM, facts, max_tokens=400)
-    except anthropic.APIError as e:
-        print(f"  (message drafting failed: {e})")
-        message = ""
-    if not message:  # template fallback so the user always gets a message
-        message = f"Dear User, regarding {num}: {brief}"
-
-    print("  USER MESSAGE:")
-    for line in message.splitlines():
-        print(f"    {line}")
-    print(f"\n✅ FINAL STATUS: {status}")
+    print("\n> COMMUNICATION AGENT")
+    decision = state.get("hitl_decision") or "NOT_REQUIRED"
+    state = {**state, "hitl_decision": decision}
+    msg = run_communication(state)
+    print(f"  USER MESSAGE: {msg}")
     return {
-        "user_message": message,
-        "final_status": status,
-        "audit_log": audit("CommunicationAgent", "draft_user_message", f"{case} → {status}"),
+        "hitl_decision": decision,
+        "user_message": msg,
+        "audit_log": audit(state, "CommunicationAgent", "user_notified", decision),
     }
 
-# ── ROUTING (Step 3) ──────────────────────────────────────────────────────────
 
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
 def route_after_sla(state: TicketState) -> str:
     return "hitl" if state.get("hitl_required") else "communication"
 
-# ── BUILD THE GRAPH ───────────────────────────────────────────────────────────
 
+# ---------------------------------------------------------------------------
+# Build graph
+# ---------------------------------------------------------------------------
 def build_graph():
     graph = StateGraph(TicketState)
     graph.add_node("triage", triage_node)
@@ -365,50 +327,79 @@ def build_graph():
     graph.add_node("hitl", hitl_node)
     graph.add_node("communication", communication_node)
 
-    graph.add_edge(START, "triage")
+    graph.set_entry_point("triage")
     graph.add_edge("triage", "resolution")
-    graph.add_edge("resolution", "sla")
-    graph.add_conditional_edges("sla", route_after_sla,
-                                {"hitl": "hitl", "communication": "communication"})
-    graph.add_edge("hitl", "communication")      # fixed edge: HITL always flows to comms
+    graph.add_edge("resolution", "sla")   # sla_node needs resolution confidence
+    graph.add_conditional_edges(
+        "sla", route_after_sla, {"hitl": "hitl", "communication": "communication"}
+    )
+    graph.add_edge("hitl", "communication")
     graph.add_edge("communication", END)
     return graph.compile()
 
 
-def process_ticket(app, ticket: dict) -> dict:
-    print(f"\n{'═' * 55}\nPROCESSING TICKET: {ticket['ticket_number']}\n{'═' * 55}")
-    return app.invoke({**ticket, "audit_log": []})
+def print_audit_trail(state: TicketState) -> None:
+    print(f"\n=== AUDIT TRAIL: {state['ticket_number']} ===")
+    for e in state.get("audit_log", []):
+        print(f"  {e['timestamp']} | {e['agent']:<18} | {e['action']:<17} | {e['detail']}")
 
-# ── TEST ON 2 TICKETS (Step 4) ────────────────────────────────────────────────
 
-test_tickets = [
-    # P2 VPN — expected: Triage → Resolution → SLA → Communication (auto-resolve)
-    {"ticket_number": "INC0001001",
-     "short_description": "VPN not connecting after password change",
-     "description": "User reports VPN client fails to connect after AD password was reset. "
-                    "Error: authentication failed.",
-     "category": "Network", "priority": "P2", "sla_due": "2024-01-15 14:00:00"},
-    # P1 SAP outage — expected: Triage → Resolution → SLA → HITL → Communication
-    # sla_due is 10:40 (as in Lab C5): the CSV's 11:00 leaves exactly 50% → AT_RISK, no HITL.
-    {"ticket_number": "INC0001002",
-     "short_description": "SAP outage - Finance users cannot access ERP",
-     "description": "Multiple users in Finance unable to login to SAP. Error code: DBCON_FAIL. "
-                    "Started 09:00 today.",
-     "category": "Application", "priority": "P1", "sla_due": "2024-01-15 10:40:00"},
+# ---------------------------------------------------------------------------
+# Test tickets
+# ---------------------------------------------------------------------------
+TEST_TICKETS: List[TicketState] = [
+    # 1) P1 SAP outage -> HITL via P1 SLA CRITICAL/BREACHED (C6 path)
+    TicketState(
+        ticket_number="INC-1001",
+        short_description="SAP production system down for all users",
+        description="Users cannot log in to SAP ERP. Production outage affecting finance.",
+        category="Application",
+        priority="P1",
+        sla_due="2024-01-15 10:30:00",
+    ),
+    # 2) P3 ticket -> HITL via LOW KB confidence (C7 Step 3)
+    #    Swap the short_description back to the VPN text to see the no-HITL path:
+    #    short_description="Unable to connect to VPN from home",
+    TicketState(
+        ticket_number="INC-1003",
+        short_description="Cisco Webex not launching on MacBook M2 after Sonoma update",
+        description="App bounces in the dock and closes. Reinstall did not help.",
+        category="Software",
+        priority="P3",
+        sla_due="2099-12-31 17:00:00",
+    ),
+    # 3) Access Grant -> HITL regardless of priority (C7 Step 4)
+    TicketState(
+        ticket_number="REQ-1002",
+        short_description="VPN access for new contractor",
+        description="Contractor needs VPN access. Email: contractor@client.com",
+        category="Access",
+        request_type="Access Grant",
+        priority="P2",
+        sla_due="2024-01-15 15:00:00",
+    ),
+    # 4) Webex on MacBook M2 -> HITL via LOW KB confidence even though P3
+    #    (SLA is past due, but the P1 SLA trigger does not apply to P3)
+    TicketState(
+        ticket_number="TEST-004",
+        short_description="Cisco Webex not launching on MacBook M2 after Sonoma update",
+        description="Cisco Webex not launching on MacBook M2 after Sonoma update.",
+        category="Software",
+        priority="P3",
+        sla_due="2024-01-17 09:00:00",
+    ),
 ]
 
-if __name__ == "__main__":
+
+def main() -> None:
     app = build_graph()
-    if "--show-graph" in sys.argv:
-        print(app.get_graph().draw_mermaid())
+    for ticket in TEST_TICKETS:
+        print("\n" + "=" * 72)
+        print(f"PROCESSING {ticket['ticket_number']}: {ticket['short_description']}")
+        print("=" * 72)
+        final = app.invoke({**ticket, "audit_log": [], "hitl_required": False, "hitl_reason": ""})
+        print_audit_trail(final)
 
-    get_kb()  # load ChromaDB once, before the first ticket
-    results = [process_ticket(app, t) for t in test_tickets]
 
-    # Step 5 — full audit log for each ticket
-    for r in results:
-        path = " → ".join(e["agent"].replace("Agent", "").replace("Gate", "") for e in r["audit_log"])
-        print(f"\n{'═' * 55}\nAUDIT LOG: {r['ticket_number']}  |  FINAL STATUS: {r.get('final_status')}")
-        print(f"Route: {path}\n{'═' * 55}")
-        for e in r["audit_log"]:
-            print(f"  {e['timestamp']}  {e['agent']:<19} {e['action']:<19} {e['detail']}")
+if __name__ == "__main__":
+    main()
