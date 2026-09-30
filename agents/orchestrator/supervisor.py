@@ -1,5 +1,5 @@
 """
-ISDO Capstone - Lab C7
+ISDO Capstone - Lab C6/C7/C8
 orchestrator/supervisor.py
 
 LangGraph StateGraph supervisor with an extended HITL (Human-in-the-Loop) gate.
@@ -12,6 +12,11 @@ The HITL gate fires for ANY of these conditions (Lab C7):
     2. Resolution Agent KB confidence is LOW (any priority)       (new in C7)
     3. Access Grant request: category == 'Access' and
        request_type == 'Access Grant' (REQ- tickets)              (new in C7)
+
+Lab C8: when the local KB returns LOW confidence, resolution_node calls the
+A2A Knowledge Specialist (POST /tasks, then GET /tasks/{task_id}) and uses its
+resolution and confidence. If the A2A server is not running, confidence stays
+LOW and the ticket falls back to the HITL gate.
 
 If the HITL decision is REJECTED, the graph still continues to the
 Communication node, but sends a 'pending approval' message instead of a
@@ -28,7 +33,12 @@ import re
 from datetime import datetime
 from typing import List, Optional, TypedDict
 
+import requests
 from langgraph.graph import END, StateGraph
+
+# A2A Knowledge Specialist (Lab C8) -- a2a/knowledge_specialist.py
+A2A_BASE_URL = "http://localhost:8001"
+A2A_TIMEOUT_SECONDS = 60   # POST /tasks runs the LLM synchronously, so allow time
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +60,9 @@ class TicketState(TypedDict, total=False):
     resolution_steps: List[str]
     kb_article: Optional[str]
     confidence: str            # HIGH / MEDIUM / LOW
+    resolution_text: str       # NEW in C8 - resolution drafted by A2A specialist
+    confidence_source: str     # NEW in C8 - LOCAL_KB / A2A / A2A_UNAVAILABLE
+    a2a_task_id: str           # NEW in C8 - task id returned by POST /tasks
     sla_status: str            # OK / AT_RISK / CRITICAL / BREACHED
     minutes_remaining: int
 
@@ -206,10 +219,45 @@ def run_communication(state: TicketState) -> str:
         )
 
     prefix = "Approved by on-call engineer. " if decision == "APPROVED" else ""
+    if state.get("confidence_source") == "A2A" and state.get("resolution_text"):
+        return (
+            f"Dear User. {prefix}Our Knowledge Specialist found a resolution for ticket {tn} "
+            f"(source: {state.get('kb_article')}, confidence {state.get('confidence')}):\n"
+            f"    {state['resolution_text']}"
+        )
     return (
         f"Dear User. {prefix}Here is the resolution for ticket {tn} "
         f"(KB {state.get('kb_article')}):\n    {steps}"
     )
+
+
+def call_a2a_knowledge_specialist(state: TicketState) -> dict:
+    """
+    Lab C8: ask the A2A Knowledge Specialist for a deeper KB lookup.
+      1) POST /tasks            -> {task_id, status}
+      2) GET  /tasks/{task_id}  -> {..., result: {resolution, confidence, ...}}
+    Raises requests.exceptions.ConnectionError if the server is not running.
+    """
+    payload = {
+        "query": f"{state['short_description']}. {state.get('description', '')}".strip(),
+        "ticket_number": state["ticket_number"],
+        "context": f"category={state.get('category')}, priority={state.get('priority')}",
+    }
+    post = requests.post(f"{A2A_BASE_URL}/tasks", json=payload, timeout=A2A_TIMEOUT_SECONDS)
+    post.raise_for_status()
+    task_id = post.json()["task_id"]
+    print(f"  [A2A] Task submitted: {task_id} (status: {post.json().get('status')})")
+
+    get = requests.get(f"{A2A_BASE_URL}/tasks/{task_id}", timeout=A2A_TIMEOUT_SECONDS)
+    get.raise_for_status()
+    result = get.json().get("result", {})
+    return {
+        "task_id": task_id,
+        "resolution_text": result.get("resolution", ""),
+        "confidence": (result.get("confidence") or "LOW").upper(),
+        "best_match": result.get("best_match"),
+        "confidence_score": result.get("confidence_score"),
+    }
 
 
 def _is_access_grant(state: TicketState) -> bool:
@@ -232,13 +280,48 @@ def triage_node(state: TicketState) -> dict:
 def resolution_node(state: TicketState) -> dict:
     print("\n> RESOLUTION AGENT")
     out = run_resolution(state)
+    out["confidence_source"] = "LOCAL_KB"
+    out["resolution_text"] = ""
     print(f"  KB: {out['kb_article'] or 'none'} | Confidence: {out['confidence']}")
-    return {
-        **out,
-        "audit_log": audit(
-            state, "ResolutionAgent", "kb_match", f"{out['kb_article'] or 'none'} ({out['confidence']})"
-        ),
-    }
+    log = audit(
+        state, "ResolutionAgent", "kb_match", f"{out['kb_article'] or 'none'} ({out['confidence']})"
+    )
+
+    # Lab C8: LOW confidence -> delegate to the A2A Knowledge Specialist
+    if out["confidence"] == "LOW":
+        print(f"  Confidence LOW -- calling A2A Knowledge Specialist at {A2A_BASE_URL}")
+        try:
+            a2a = call_a2a_knowledge_specialist(state)
+            out["a2a_task_id"] = a2a["task_id"]
+            out["resolution_text"] = a2a["resolution_text"]
+            out["confidence"] = a2a["confidence"]
+            out["confidence_source"] = "A2A"
+            if a2a.get("best_match"):
+                out["kb_article"] = a2a["best_match"]
+            print(
+                f"  [A2A] Result: {a2a['best_match']} | Confidence: {a2a['confidence']}"
+                f" (score {a2a['confidence_score']})"
+            )
+            log = audit(
+                {**state, "audit_log": log}, "ResolutionAgent", "a2a_result",
+                f"task {a2a['task_id']} -> {a2a['confidence']} ({a2a['best_match']})",
+            )
+        except requests.exceptions.ConnectionError:
+            out["confidence_source"] = "A2A_UNAVAILABLE"
+            print("  [A2A] Knowledge Specialist not reachable -- falling back to HITL")
+            log = audit(
+                {**state, "audit_log": log}, "ResolutionAgent", "a2a_unavailable",
+                "ConnectionError -- confidence stays LOW, HITL fallback",
+            )
+        except (requests.exceptions.RequestException, KeyError, ValueError) as exc:
+            out["confidence_source"] = "A2A_UNAVAILABLE"
+            print(f"  [A2A] Call failed ({type(exc).__name__}) -- falling back to HITL")
+            log = audit(
+                {**state, "audit_log": log}, "ResolutionAgent", "a2a_error",
+                f"{type(exc).__name__}: {exc} -- HITL fallback",
+            )
+
+    return {**out, "audit_log": log}
 
 
 def sla_node(state: TicketState) -> dict:
@@ -256,7 +339,16 @@ def sla_node(state: TicketState) -> dict:
 
     # Trigger 2: LOW KB confidence, regardless of priority
     if merged.get("confidence") == "LOW":
-        reasons.append("LOW KB CONFIDENCE -- Resolution Agent could not find a clear fix")
+        if merged.get("confidence_source") == "A2A_UNAVAILABLE":
+            reasons.append(
+                "LOW KB CONFIDENCE -- A2A Knowledge Specialist unavailable, no clear fix found"
+            )
+        elif merged.get("confidence_source") == "A2A":
+            reasons.append(
+                "LOW KB CONFIDENCE -- even the A2A Knowledge Specialist could not find a clear fix"
+            )
+        else:
+            reasons.append("LOW KB CONFIDENCE -- Resolution Agent could not find a clear fix")
 
     # Trigger 3: Access Grant request, regardless of priority
     if _is_access_grant(merged):
